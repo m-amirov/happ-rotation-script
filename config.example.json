@@ -13,6 +13,11 @@
   "mode": "round-robin",
   "interval_seconds": 600,
   "settle_seconds": 4,
-  "reconnect_mode": "happ",
-  "require_subscription_visible": true
+  "happ_window_regex": "^Happ(?:\\s|$).*",
+  "process_names": [
+    "happ.exe"
+  ],
+  "click_x_ratio": 0.365,
+  "first_server_y_ratio": 0.322,
+  "row_step_ratio": 0.0713
 }
