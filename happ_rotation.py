@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Rotate servers inside an existing Happ Desktop subscription on Windows.
 
-This script does NOT generate or import a new Xray configuration. It drives the
-existing Happ UI through Windows UI Automation and clicks a server row inside a
-subscription that is already present in Happ.
+Happ 4.3.x renders the server list as a custom UI surface that may expose no
+child controls through Windows UI Automation. This implementation therefore
+finds the real Happ HWND and clicks server rows by coordinates relative to the
+Happ client area.
 
-Designed for Happ Desktop 4.3.x on Windows.
+No VPN configuration, subscription URL, or Happ internal database is modified.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import random
 import re
 import sys
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -29,13 +29,6 @@ class RotationError(RuntimeError):
     pass
 
 
-def normalize_text(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value or "")
-    value = value.replace("\ufe0f", "")
-    value = re.sub(r"\s+", " ", value).strip().casefold()
-    return value
-
-
 @dataclass(frozen=True)
 class RotationConfig:
     subscription: str
@@ -44,8 +37,11 @@ class RotationConfig:
     interval_seconds: int = 600
     settle_seconds: float = 4.0
     happ_window_regex: str = r"^Happ(?:\s|$).*"
-    reconnect_mode: str = "happ"
-    require_subscription_visible: bool = True
+    process_names: tuple[str, ...] = ("happ.exe",)
+    click_x_ratio: float = 0.365
+    first_server_y_ratio: float = 0.322
+    row_step_ratio: float = 0.0713
+    server_rows: dict[str, int] | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RotationConfig":
@@ -73,9 +69,34 @@ class RotationConfig:
         if settle < 0:
             raise RotationError("config: settle_seconds must be >= 0")
 
-        reconnect_mode = str(raw.get("reconnect_mode", "happ")).strip().lower()
-        if reconnect_mode not in {"happ", "none"}:
-            raise RotationError("config: reconnect_mode must be 'happ' or 'none'")
+        process_names_raw = raw.get("process_names", ["happ.exe"])
+        if not isinstance(process_names_raw, list) or not process_names_raw:
+            raise RotationError("config: process_names must be a non-empty array")
+        process_names = tuple(str(x).strip().casefold() for x in process_names_raw if str(x).strip())
+
+        click_x_ratio = float(raw.get("click_x_ratio", 0.365))
+        first_server_y_ratio = float(raw.get("first_server_y_ratio", 0.322))
+        row_step_ratio = float(raw.get("row_step_ratio", 0.0713))
+
+        for key, value in {
+            "click_x_ratio": click_x_ratio,
+            "first_server_y_ratio": first_server_y_ratio,
+            "row_step_ratio": row_step_ratio,
+        }.items():
+            if not 0.0 < value < 1.0:
+                raise RotationError(f"config: {key} must be between 0 and 1")
+
+        server_rows_raw = raw.get("server_rows")
+        server_rows: dict[str, int] | None = None
+        if server_rows_raw is not None:
+            if not isinstance(server_rows_raw, dict):
+                raise RotationError("config: server_rows must be an object")
+            server_rows = {}
+            for name, row in server_rows_raw.items():
+                row_i = int(row)
+                if row_i < 0:
+                    raise RotationError("config: server row indexes must be >= 0")
+                server_rows[str(name)] = row_i
 
         return cls(
             subscription=subscription,
@@ -84,9 +105,20 @@ class RotationConfig:
             interval_seconds=interval,
             settle_seconds=settle,
             happ_window_regex=str(raw.get("happ_window_regex", r"^Happ(?:\s|$).*")),
-            reconnect_mode=reconnect_mode,
-            require_subscription_visible=bool(raw.get("require_subscription_visible", True)),
+            process_names=process_names,
+            click_x_ratio=click_x_ratio,
+            first_server_y_ratio=first_server_y_ratio,
+            row_step_ratio=row_step_ratio,
+            server_rows=server_rows,
         )
+
+    def row_for_server(self, server: str) -> int:
+        if self.server_rows and server in self.server_rows:
+            return self.server_rows[server]
+        try:
+            return self.servers.index(server)
+        except ValueError as exc:
+            raise RotationError(f"Server {server!r} is not configured") from exc
 
 
 def load_config(path: Path) -> RotationConfig:
@@ -103,6 +135,22 @@ def load_config(path: Path) -> RotationConfig:
     return RotationConfig.from_dict(raw)
 
 
+def load_config_raw(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError as exc:
+        raise RotationError(f"Config file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RotationError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise RotationError("config root must be a JSON object")
+    return raw
+
+
+def save_config_raw(path: Path, raw: dict[str, Any]) -> None:
+    path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -114,10 +162,7 @@ def load_state(path: Path) -> dict[str, Any]:
 
 
 def save_state(path: Path, server: str) -> None:
-    data = {
-        "last_server": server,
-        "updated_at_unix": int(time.time()),
-    }
+    data = {"last_server": server, "updated_at_unix": int(time.time())}
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -138,43 +183,34 @@ def choose_next_server(
 
     if mode == "random":
         rng = rng or random.Random()
-        if len(items) == 1:
-            return items[0]
-        candidates = [x for x in items if x != last_server]
+        candidates = [x for x in items if x != last_server] or items
         return rng.choice(candidates)
 
     raise RotationError(f"Unsupported rotation mode: {mode}")
 
 
-class HappUI:
-    def __init__(self, window_regex: str):
-        self.window_regex = re.compile(window_regex, re.IGNORECASE)
-        self.window = None
+class Win32UI:
+    def __init__(self, cfg: RotationConfig):
+        self.cfg = cfg
 
     @staticmethod
-    def _import_pywinauto():
+    def _require_windows() -> None:
         if sys.platform != "win32":
-            raise RotationError("Happ UI automation is supported only on Windows")
-        try:
-            from pywinauto import Desktop
-        except ImportError as exc:
-            raise RotationError(
-                "pywinauto is not installed. Run: py -m pip install -r requirements.txt"
-            ) from exc
-        return Desktop
+            raise RotationError("Happ window control is supported only on Windows")
 
     @staticmethod
-    def _native_windows() -> list[dict[str, Any]]:
-        """Enumerate real top-level HWNDs, including windows UIA may omit."""
-        if sys.platform != "win32":
-            return []
-
+    def _apis():
+        Win32UI._require_windows()
         import ctypes
         from ctypes import wintypes
 
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        return ctypes, wintypes, user32, kernel32
 
+    @staticmethod
+    def windows() -> list[dict[str, Any]]:
+        ctypes, wintypes, user32, kernel32 = Win32UI._apis()
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         results: list[dict[str, Any]] = []
 
@@ -205,19 +241,25 @@ class HappUI:
                 return True
 
             length = user32.GetWindowTextLengthW(hwnd)
-            buf = ctypes.create_unicode_buffer(max(length + 1, 2))
-            user32.GetWindowTextW(hwnd, buf, len(buf))
+            title_buf = ctypes.create_unicode_buffer(max(length + 1, 2))
+            user32.GetWindowTextW(hwnd, title_buf, len(title_buf))
 
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
 
-            image = process_image(pid.value)
+            rect = wintypes.RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                bounds = (rect.left, rect.top, rect.right, rect.bottom)
+            else:
+                bounds = (0, 0, 0, 0)
+
             results.append(
                 {
                     "handle": int(hwnd),
-                    "title": buf.value,
+                    "title": title_buf.value,
                     "pid": int(pid.value),
-                    "image": image,
+                    "image": process_image(pid.value),
+                    "rect": bounds,
                 }
             )
             return True
@@ -228,255 +270,113 @@ class HappUI:
     @staticmethod
     def visible_window_lines() -> list[str]:
         lines = []
-        for item in HappUI._native_windows():
+        for item in Win32UI.windows():
             image = Path(item["image"]).name if item["image"] else "?"
             title = item["title"] or "<no title>"
+            l, t, r, b = item["rect"]
             lines.append(
-                f"HWND=0x{item['handle']:X} PID={item['pid']} EXE={image!r} TITLE={title!r}"
+                f"HWND=0x{item['handle']:X} PID={item['pid']} EXE={image!r} "
+                f"TITLE={title!r} RECT=({l},{t})-({r},{b})"
             )
         return lines
 
-    @staticmethod
-    def _name(control: Any) -> str:
-        try:
-            name = control.window_text()
-            if name:
-                return str(name)
-        except Exception:
-            pass
-        try:
-            return str(control.element_info.name or "")
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _control_type(control: Any) -> str:
-        try:
-            return str(control.element_info.control_type or "")
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _rectangle(control: Any):
-        try:
-            return control.rectangle()
-        except Exception:
-            return None
-
-    def connect(self) -> Any:
-        Desktop = self._import_pywinauto()
-        candidates: list[Any] = []
-        seen_handles: set[int] = set()
-
-        # First try the normal UI Automation enumeration.
-        try:
-            for win in Desktop(backend="uia").windows():
-                try:
-                    title = win.window_text() or ""
-                    if self.window_regex.search(title) and win.is_visible():
-                        handle = int(getattr(win, "handle", 0) or 0)
-                        if handle:
-                            seen_handles.add(handle)
-                        candidates.append(win)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # Happ uses a custom desktop UI. Some builds are visible as a normal
-        # HWND but are omitted by Desktop(backend="uia").windows(). Enumerate
-        # native windows and then wrap the matching HWND with UIA explicitly.
-        for item in self._native_windows():
-            handle = item["handle"]
-            if handle in seen_handles:
-                continue
-
+    def find_happ(self) -> dict[str, Any]:
+        regex = re.compile(self.cfg.happ_window_regex, re.IGNORECASE)
+        candidates = []
+        for item in self.windows():
+            exe = Path(item["image"]).name.casefold() if item["image"] else ""
             title = item["title"] or ""
-            exe_name = Path(item["image"]).name.casefold() if item["image"] else ""
-            title_match = bool(self.window_regex.search(title))
-            process_match = exe_name in {"happ.exe", "happ"}
-
-            if not (title_match or process_match):
-                continue
-
-            try:
-                win = Desktop(backend="uia").window(handle=handle).wrapper_object()
-                candidates.append(win)
-                seen_handles.add(handle)
-                continue
-            except Exception:
-                pass
-
-            # Last-resort wrapper. This can still be useful for diagnostics,
-            # although child controls are richer through UIA.
-            try:
-                win = Desktop(backend="win32").window(handle=handle).wrapper_object()
-                candidates.append(win)
-                seen_handles.add(handle)
-            except Exception:
-                continue
+            if exe in self.cfg.process_names or regex.search(title):
+                l, t, r, b = item["rect"]
+                area = max(0, r - l) * max(0, b - t)
+                if area > 0:
+                    candidates.append((area, item))
 
         if not candidates:
-            visible = self.visible_window_lines()
-            hint = ""
-            if visible:
-                sample = "\n".join(visible[:20])
-                hint = (
-                    "\nVisible top-level windows were:\n"
-                    + sample
-                    + "\nRun --list-windows for the complete list."
-                )
             raise RotationError(
-                "Happ window not found. Start Happ and open the Servers page."
-                + hint
+                "Happ window not found. Start Happ and keep its main window open. "
+                "Use --list-windows for diagnostics."
             )
 
-        # Prefer the largest visible matching window, not tray/tool windows.
-        candidates.sort(
-            key=lambda w: (
-                (w.rectangle().width() * w.rectangle().height())
-                if self._rectangle(w)
-                else 0
-            ),
-            reverse=True,
-        )
-        self.window = candidates[0]
-
-        try:
-            if self.window.is_minimized():
-                self.window.restore()
-        except Exception:
-            pass
-
-        return self.window
-
-    def controls(self) -> list[Any]:
-        if self.window is None:
-            self.connect()
-        try:
-            return list(self.window.descendants())
-        except Exception as exc:
-            raise RotationError(f"Unable to enumerate Happ UI controls: {exc}") from exc
-
-    def inspect_lines(self) -> list[str]:
-        lines = []
-        for control in self.controls():
-            name = self._name(control).strip()
-            ctype = self._control_type(control)
-            rect = self._rectangle(control)
-            if not name:
-                continue
-            if rect:
-                pos = f"({rect.left},{rect.top})-({rect.right},{rect.bottom})"
-            else:
-                pos = "(no-rect)"
-            lines.append(f"[{ctype}] {name!r} {pos}")
-        return lines
-
-    def _matching_controls(self, needle: str) -> list[Any]:
-        wanted = normalize_text(needle)
-        exact = []
-        partial = []
-        for control in self.controls():
-            name = self._name(control)
-            normalized = normalize_text(name)
-            if not normalized:
-                continue
-            if normalized == wanted:
-                exact.append(control)
-            elif wanted in normalized:
-                partial.append(control)
-
-        matches = exact or partial
-
-        # A server name may also be displayed in the right-side details area.
-        # Prefer the left-most matching UI element, which corresponds to the
-        # subscription/server list in Happ Desktop.
-        def sort_key(control: Any):
-            rect = self._rectangle(control)
-            left = rect.left if rect else 10**9
-            top = rect.top if rect else 10**9
-            area = rect.width() * rect.height() if rect else 10**9
-            return (left, top, area)
-
-        return sorted(matches, key=sort_key)
-
-    def has_text(self, text: str) -> bool:
-        return bool(self._matching_controls(text))
-
-    def _invoke_or_click(self, control: Any) -> None:
-        # Prefer UIA InvokePattern, because it does not depend on coordinates.
-        for candidate in [control, *self._parents(control, limit=4)]:
-            try:
-                iface = getattr(candidate, "iface_invoke", None)
-                if iface is not None:
-                    iface.Invoke()
-                    return
-            except Exception:
-                pass
-
-        # Fallback to a real mouse click on the matching text/row.
-        for candidate in [control, *self._parents(control, limit=4)]:
-            try:
-                candidate.click_input()
-                return
-            except Exception:
-                continue
-
-        raise RotationError(
-            f"Found UI element {self._name(control)!r}, but could not click it"
-        )
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
 
     @staticmethod
-    def _parents(control: Any, limit: int) -> list[Any]:
-        out = []
-        cur = control
-        for _ in range(limit):
-            try:
-                cur = cur.parent()
-            except Exception:
-                break
-            if cur is None:
-                break
-            out.append(cur)
-        return out
+    def client_rect_screen(hwnd: int) -> tuple[int, int, int, int]:
+        ctypes, wintypes, user32, _kernel32 = Win32UI._apis()
+        rect = wintypes.RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            raise RotationError("GetClientRect failed for Happ window")
 
-    def ensure_subscription_and_server_visible(
-        self, subscription: str, server: str, require_subscription_visible: bool
-    ) -> None:
-        if self.has_text(server):
-            return
+        top_left = wintypes.POINT(rect.left, rect.top)
+        bottom_right = wintypes.POINT(rect.right, rect.bottom)
+        if not user32.ClientToScreen(hwnd, ctypes.byref(top_left)):
+            raise RotationError("ClientToScreen failed for Happ window")
+        if not user32.ClientToScreen(hwnd, ctypes.byref(bottom_right)):
+            raise RotationError("ClientToScreen failed for Happ window")
 
-        subs = self._matching_controls(subscription)
-        if not subs:
-            if require_subscription_visible:
-                raise RotationError(
-                    f"Subscription {subscription!r} was not found in the visible Happ UI"
-                )
-            return
+        return (top_left.x, top_left.y, bottom_right.x, bottom_right.y)
 
-        # Server is not visible; the subscription is probably collapsed.
-        self._invoke_or_click(subs[0])
-        time.sleep(1.0)
+    @staticmethod
+    def foreground(hwnd: int) -> None:
+        _ctypes, _wintypes, user32, _kernel32 = Win32UI._apis()
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.25)
 
-        if not self.has_text(server):
+    @staticmethod
+    def cursor_position() -> tuple[int, int]:
+        ctypes, wintypes, user32, _kernel32 = Win32UI._apis()
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            raise RotationError("GetCursorPos failed")
+        return pt.x, pt.y
+
+    @staticmethod
+    def click_screen(x: int, y: int, restore_cursor: bool = True) -> None:
+        _ctypes, _wintypes, user32, _kernel32 = Win32UI._apis()
+        old_x, old_y = Win32UI.cursor_position()
+
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+
+        if not user32.SetCursorPos(int(x), int(y)):
+            raise RotationError("SetCursorPos failed")
+        time.sleep(0.08)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+        if restore_cursor:
+            time.sleep(0.08)
+            user32.SetCursorPos(old_x, old_y)
+
+    def coordinate_for_row(self, row: int) -> tuple[int, int, tuple[int, int, int, int]]:
+        happ = self.find_happ()
+        rect = self.client_rect_screen(happ["handle"])
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+
+        x = left + round(width * self.cfg.click_x_ratio)
+        y_ratio = self.cfg.first_server_y_ratio + row * self.cfg.row_step_ratio
+        y = top + round(height * y_ratio)
+
+        if not (left <= x < right and top <= y < bottom):
             raise RotationError(
-                f"Server {server!r} is not visible after expanding subscription "
-                f"{subscription!r}. Check config.json or run --inspect."
+                f"Calculated click point ({x},{y}) is outside Happ client rect {rect}. "
+                "Run --calibrate."
             )
+        return x, y, rect
 
-    def select_server(
-        self, subscription: str, server: str, require_subscription_visible: bool = True
-    ) -> None:
-        self.ensure_subscription_and_server_visible(
-            subscription, server, require_subscription_visible
-        )
-        matches = self._matching_controls(server)
-        if not matches:
-            raise RotationError(
-                f"Server {server!r} was not found. Run --inspect to see names exposed by Happ."
-            )
-        self._invoke_or_click(matches[0])
+    def select_server(self, server: str) -> tuple[int, int]:
+        row = self.cfg.row_for_server(server)
+        happ = self.find_happ()
+        self.foreground(happ["handle"])
+        x, y, _rect = self.coordinate_for_row(row)
+        self.click_screen(x, y)
+        return x, y
 
 
 def rotate_once(
@@ -486,38 +386,29 @@ def rotate_once(
     dry_run: bool = False,
 ) -> str:
     state = load_state(state_path)
-    last = state.get("last_server")
-    target = explicit_server or choose_next_server(cfg.servers, last, cfg.mode)
-
-    if explicit_server and explicit_server not in cfg.servers:
-        raise RotationError(
-            f"Server {explicit_server!r} is not present in config.json servers"
-        )
-
-    print(f"Target server: {target}")
-
-    if dry_run:
-        print("DRY RUN: Happ was not changed")
-        return target
-
-    ui = HappUI(cfg.happ_window_regex)
-    ui.connect()
-    ui.select_server(
-        subscription=cfg.subscription,
-        server=target,
-        require_subscription_visible=cfg.require_subscription_visible,
+    target = explicit_server or choose_next_server(
+        cfg.servers, state.get("last_server"), cfg.mode
     )
 
-    # Happ Desktop normally reconnects when another server is selected while
-    # connected. We deliberately do not click the power button here: that
-    # avoids a second, unnecessary disconnect/reconnect cycle. If a future
-    # Happ build stops auto-switching, reconnect_mode can be extended without
-    # changing the rotation/state logic.
+    if target not in cfg.servers:
+        raise RotationError(f"Server {target!r} is not present in config.json")
+
+    ui = Win32UI(cfg)
+    row = cfg.row_for_server(target)
+    x, y, rect = ui.coordinate_for_row(row)
+    print(f"Target server: {target}")
+    print(f"Happ client: {rect}; row={row}; click=({x},{y})")
+
+    if dry_run:
+        print("DRY RUN: no click was made")
+        return target
+
+    ui.select_server(target)
     if cfg.settle_seconds:
         time.sleep(cfg.settle_seconds)
 
     save_state(state_path, target)
-    print(f"OK: selected {target}")
+    print(f"OK: selected row for {target}")
     return target
 
 
@@ -526,80 +417,106 @@ def run_watch(cfg: RotationConfig, state_path: Path, dry_run: bool) -> int:
         f"Rotation started: subscription={cfg.subscription!r}, "
         f"mode={cfg.mode}, interval={cfg.interval_seconds}s"
     )
-    print("Press Ctrl+C to stop.")
-
+    print("Keep the subscription expanded in Happ. Press Ctrl+C to stop.")
     while True:
         try:
             rotate_once(cfg, state_path, dry_run=dry_run)
         except RotationError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
+        time.sleep(cfg.interval_seconds)
 
-        try:
-            time.sleep(cfg.interval_seconds)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            return 0
+
+def calibrate(config_path: Path) -> int:
+    cfg = load_config(config_path)
+    if len(cfg.servers) < 2:
+        raise RotationError("Calibration needs at least two configured servers")
+
+    ui = Win32UI(cfg)
+    happ = ui.find_happ()
+    ui.foreground(happ["handle"])
+    left, top, right, bottom = ui.client_rect_screen(happ["handle"])
+    width = right - left
+    height = bottom - top
+
+    first = cfg.servers[0]
+    second = cfg.servers[1]
+
+    print("Calibration uses your mouse position; it does NOT click anything.")
+    print(f"Move the pointer to the CENTER of the row {first!r} in Happ, then press Enter here.")
+    input()
+    x1, y1 = ui.cursor_position()
+
+    print(f"Now move the pointer to the CENTER of the row {second!r}, then press Enter here.")
+    input()
+    x2, y2 = ui.cursor_position()
+
+    if not (left <= x1 < right and top <= y1 < bottom):
+        raise RotationError("First calibration point is outside the Happ client area")
+    if not (left <= x2 < right and top <= y2 < bottom):
+        raise RotationError("Second calibration point is outside the Happ client area")
+    if y2 <= y1:
+        raise RotationError("Second row must be below the first row")
+
+    click_x_ratio = ((x1 + x2) / 2 - left) / width
+    first_y_ratio = (y1 - top) / height
+    row_step_ratio = (y2 - y1) / height
+
+    raw = load_config_raw(config_path)
+    raw["click_x_ratio"] = round(click_x_ratio, 6)
+    raw["first_server_y_ratio"] = round(first_y_ratio, 6)
+    raw["row_step_ratio"] = round(row_step_ratio, 6)
+    save_config_raw(config_path, raw)
+
+    print("Saved calibration:")
+    print(f"  click_x_ratio={raw['click_x_ratio']}")
+    print(f"  first_server_y_ratio={raw['first_server_y_ratio']}")
+    print(f"  row_step_ratio={raw['row_step_ratio']}")
+    return 0
+
+
+def preview(cfg: RotationConfig) -> int:
+    ui = Win32UI(cfg)
+    print(f"Subscription: {cfg.subscription}")
+    for server in cfg.servers:
+        row = cfg.row_for_server(server)
+        x, y, rect = ui.coordinate_for_row(row)
+        print(f"{row:02d}  {server}: ({x},{y})")
+    print(f"Happ client rect: {rect}")
+    return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Rotate server rows inside an existing Happ Desktop subscription."
     )
-    parser.add_argument(
-        "--config", default=DEFAULT_CONFIG, help="path to config.json"
-    )
-    parser.add_argument(
-        "--state", default=DEFAULT_STATE, help="rotation state file"
-    )
-    parser.add_argument(
-        "--once", action="store_true", help="perform one server switch and exit"
-    )
-    parser.add_argument(
-        "--server", help="select this configured server once and exit"
-    )
-    parser.add_argument(
-        "--inspect",
-        action="store_true",
-        help="print text controls exposed by the current Happ window and exit",
-    )
-    parser.add_argument(
-        "--list-windows",
-        action="store_true",
-        help="print visible top-level Windows HWNDs/processes and exit",
-    )
-    parser.add_argument(
-        "--inspect-output",
-        help="also save --inspect output to this UTF-8 text file",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="choose targets but do not click Happ",
-    )
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--state", default=DEFAULT_STATE)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--server")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--calibrate", action="store_true")
+    parser.add_argument("--preview-clicks", action="store_true")
+    parser.add_argument("--list-windows", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-
     try:
         if args.list_windows:
-            lines = HappUI.visible_window_lines()
-            print("\n".join(lines))
+            print("\n".join(Win32UI.visible_window_lines()))
             return 0
 
-        if args.inspect:
-            ui = HappUI(r"^Happ(?:\s|$).*")
-            ui.connect()
-            lines = ui.inspect_lines()
-            payload = "\n".join(lines) + ("\n" if lines else "")
-            print(payload, end="")
-            if args.inspect_output:
-                Path(args.inspect_output).write_text(payload, encoding="utf-8")
-                print(f"Saved: {args.inspect_output}", file=sys.stderr)
-            return 0
+        config_path = Path(args.config)
 
-        cfg = load_config(Path(args.config))
+        if args.calibrate:
+            return calibrate(config_path)
+
+        cfg = load_config(config_path)
+
+        if args.preview_clicks:
+            return preview(cfg)
+
         state_path = Path(args.state)
 
         if args.server:
