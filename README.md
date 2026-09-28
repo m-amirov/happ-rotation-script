@@ -64,11 +64,20 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Установите зависимость:
+Убедитесь, что в Python установлен `pip`:
+
+```powershell
+py -m ensurepip --upgrade
+py -m pip install --upgrade pip
+```
+
+Затем установите зависимость:
 
 ```powershell
 py -m pip install -r requirements.txt
 ```
+
+Если команда `py -m ensurepip --upgrade` отвечает `No module named ensurepip`, текущая установка Python была установлена без стандартных компонентов. В Windows откройте **Settings → Apps → Installed apps → Python → Modify** и включите `pip`, либо установите обычный Python с python.org с компонентами `pip` и `py launcher`. После этого повторите команды выше.
 
 Создайте рабочий конфиг:
 
