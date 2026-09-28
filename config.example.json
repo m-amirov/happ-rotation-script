@@ -1,0 +1,18 @@
+{
+  "subscription": "LagomVPN",
+  "servers": [
+    "Германия",
+    "Финляндия",
+    "Швеция",
+    "Великобритания",
+    "Италия",
+    "Япония",
+    "США",
+    "Турция"
+  ],
+  "mode": "round-robin",
+  "interval_seconds": 600,
+  "settle_seconds": 4,
+  "reconnect_mode": "happ",
+  "require_subscription_visible": true
+}
