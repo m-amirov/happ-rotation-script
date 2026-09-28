@@ -1,87 +1,106 @@
-import base64
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
 
-from happ_rotation import build_config, load_proxies, parse_proxy_line
+from happ_rotation import (
+    RotationConfig,
+    RotationError,
+    choose_next_server,
+    load_config,
+    load_state,
+    normalize_text,
+    save_state,
+)
 
 
-class ParserTests(unittest.TestCase):
-    def test_socks(self):
-        outbound = parse_proxy_line("socks://alice:secret@127.0.0.1:1080")
-        self.assertEqual(outbound["protocol"], "socks")
-        self.assertEqual(outbound["settings"]["user"], "alice")
-        self.assertEqual(outbound["settings"]["pass"], "secret")
+class TextTests(unittest.TestCase):
+    def test_normalize_text(self):
+        self.assertEqual(normalize_text("  США  "), "сша")
+        self.assertEqual(normalize_text("LagomVPN ✨"), "lagomvpn ✨")
 
-    def test_vless_reality(self):
-        outbound = parse_proxy_line(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
-            "?encryption=none&security=reality&type=tcp&sni=www.microsoft.com"
-            "&fp=chrome&pbk=abc&sid=1234&flow=xtls-rprx-vision"
-        )
-        self.assertEqual(outbound["protocol"], "vless")
-        self.assertEqual(outbound["streamSettings"]["method"], "raw")
-        self.assertEqual(outbound["streamSettings"]["security"], "reality")
+
+class RotationTests(unittest.TestCase):
+    def test_round_robin_starts_with_first(self):
+        servers = ["Германия", "Финляндия", "США"]
         self.assertEqual(
-            outbound["streamSettings"]["realitySettings"]["password"], "abc"
+            choose_next_server(servers, None, "round-robin"), "Германия"
         )
 
-    def test_vmess(self):
-        payload = {
-            "v": "2",
-            "ps": "test",
-            "add": "vm.example.com",
-            "port": "443",
-            "id": "11111111-1111-1111-1111-111111111111",
-            "scy": "auto",
-            "net": "ws",
-            "tls": "tls",
-            "sni": "vm.example.com",
-            "host": "vm.example.com",
-            "path": "/ws",
-        }
-        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-        outbound = parse_proxy_line("vmess://" + encoded)
-        self.assertEqual(outbound["protocol"], "vmess")
-        self.assertEqual(outbound["streamSettings"]["method"], "websocket")
-
-    def test_shadowsocks(self):
-        userinfo = base64.urlsafe_b64encode(b"aes-256-gcm:secret").decode().rstrip("=")
-        outbound = parse_proxy_line(f"ss://{userinfo}@ss.example.com:8388")
-        self.assertEqual(outbound["protocol"], "shadowsocks")
-        self.assertEqual(outbound["settings"]["method"], "aes-256-gcm")
-
-    def test_raw_outbound(self):
-        outbound = parse_proxy_line(
-            '{"protocol":"socks","settings":{"address":"127.0.0.1","port":1080}}'
+    def test_round_robin_advances_and_wraps(self):
+        servers = ["Германия", "Финляндия", "США"]
+        self.assertEqual(
+            choose_next_server(servers, "Германия", "round-robin"), "Финляндия"
         )
-        self.assertEqual(outbound["protocol"], "socks")
+        self.assertEqual(
+            choose_next_server(servers, "США", "round-robin"), "Германия"
+        )
+
+    def test_random_does_not_repeat_last_when_possible(self):
+        servers = ["Германия", "Финляндия", "США"]
+        rng = random.Random(1)
+        for _ in range(20):
+            self.assertNotEqual(
+                choose_next_server(servers, "США", "random", rng), "США"
+            )
 
 
 class ConfigTests(unittest.TestCase):
-    def test_build_round_robin_fail_closed_and_ru_direct(self):
-        proxies = [
-            {"protocol": "socks", "settings": {"address": "127.0.0.1", "port": 1080}, "tag": "proxy-001"},
-            {"protocol": "socks", "settings": {"address": "127.0.0.1", "port": 1081}, "tag": "proxy-002"},
-        ]
-        config = build_config(proxies)
-        balancer = config["routing"]["balancers"][0]
-        self.assertEqual(balancer["strategy"]["type"], "roundRobin")
-        self.assertEqual(balancer["fallbackTag"], "block")
-        self.assertTrue(any("geoip:ru" in r.get("ip", []) for r in config["routing"]["rules"]))
-        self.assertTrue(any("geosite:category-ru" in r.get("domain", []) for r in config["routing"]["rules"]))
+    def test_config_valid(self):
+        cfg = RotationConfig.from_dict(
+            {
+                "subscription": "LagomVPN",
+                "servers": ["Германия", "США"],
+                "mode": "round-robin",
+                "interval_seconds": 60,
+            }
+        )
+        self.assertEqual(cfg.subscription, "LagomVPN")
+        self.assertEqual(cfg.servers, ("Германия", "США"))
 
-    def test_load_proxy_file_assigns_unique_tags(self):
+    def test_requires_two_servers(self):
+        with self.assertRaises(RotationError):
+            RotationConfig.from_dict(
+                {
+                    "subscription": "LagomVPN",
+                    "servers": ["США"],
+                    "interval_seconds": 60,
+                }
+            )
+
+    def test_interval_minimum(self):
+        with self.assertRaises(RotationError):
+            RotationConfig.from_dict(
+                {
+                    "subscription": "LagomVPN",
+                    "servers": ["Германия", "США"],
+                    "interval_seconds": 5,
+                }
+            )
+
+    def test_load_config_and_state(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "proxies.txt"
-            path.write_text(
-                "socks://127.0.0.1:1080\n"
-                "socks://127.0.0.1:1081\n",
+            cfg_path = Path(tmp) / "config.json"
+            state_path = Path(tmp) / "state.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "subscription": "LagomVPN",
+                        "servers": ["Германия", "США"],
+                        "mode": "round-robin",
+                        "interval_seconds": 60,
+                    },
+                    ensure_ascii=False,
+                ),
                 encoding="utf-8",
             )
-            proxies = load_proxies(path)
-        self.assertEqual([p["tag"] for p in proxies], ["proxy-001", "proxy-002"])
+            cfg = load_config(cfg_path)
+            self.assertEqual(cfg.servers[1], "США")
+
+            save_state(state_path, "США")
+            state = load_state(state_path)
+            self.assertEqual(state["last_server"], "США")
 
 
 if __name__ == "__main__":
