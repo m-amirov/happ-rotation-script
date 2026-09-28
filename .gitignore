@@ -1,0 +1,7 @@
+# Real proxy credentials must stay local.
+proxies.txt
+happ-rotation.json
+*.local.json
+__pycache__/
+*.pyc
+.pytest_cache/
