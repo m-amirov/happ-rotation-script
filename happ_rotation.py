@@ -164,6 +164,79 @@ class HappUI:
         return Desktop
 
     @staticmethod
+    def _native_windows() -> list[dict[str, Any]]:
+        """Enumerate real top-level HWNDs, including windows UIA may omit."""
+        if sys.platform != "win32":
+            return []
+
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        results: list[dict[str, Any]] = []
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+
+        def process_image(pid: int) -> str:
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                return ""
+            try:
+                size = wintypes.DWORD(32768)
+                buf = ctypes.create_unicode_buffer(size.value)
+                if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(size)
+                ):
+                    return buf.value
+                return ""
+            finally:
+                kernel32.CloseHandle(handle)
+
+        @EnumWindowsProc
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+
+            length = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(max(length + 1, 2))
+            user32.GetWindowTextW(hwnd, buf, len(buf))
+
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+            image = process_image(pid.value)
+            results.append(
+                {
+                    "handle": int(hwnd),
+                    "title": buf.value,
+                    "pid": int(pid.value),
+                    "image": image,
+                }
+            )
+            return True
+
+        user32.EnumWindows(callback, 0)
+        return results
+
+    @staticmethod
+    def visible_window_lines() -> list[str]:
+        lines = []
+        for item in HappUI._native_windows():
+            image = Path(item["image"]).name if item["image"] else "?"
+            title = item["title"] or "<no title>"
+            lines.append(
+                f"HWND=0x{item['handle']:X} PID={item['pid']} EXE={image!r} TITLE={title!r}"
+            )
+        return lines
+
+    @staticmethod
     def _name(control: Any) -> str:
         try:
             name = control.window_text()
@@ -192,20 +265,70 @@ class HappUI:
 
     def connect(self) -> Any:
         Desktop = self._import_pywinauto()
-        desktop = Desktop(backend="uia")
+        candidates: list[Any] = []
+        seen_handles: set[int] = set()
 
-        candidates = []
-        for win in desktop.windows():
+        # First try the normal UI Automation enumeration.
+        try:
+            for win in Desktop(backend="uia").windows():
+                try:
+                    title = win.window_text() or ""
+                    if self.window_regex.search(title) and win.is_visible():
+                        handle = int(getattr(win, "handle", 0) or 0)
+                        if handle:
+                            seen_handles.add(handle)
+                        candidates.append(win)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Happ uses a custom desktop UI. Some builds are visible as a normal
+        # HWND but are omitted by Desktop(backend="uia").windows(). Enumerate
+        # native windows and then wrap the matching HWND with UIA explicitly.
+        for item in self._native_windows():
+            handle = item["handle"]
+            if handle in seen_handles:
+                continue
+
+            title = item["title"] or ""
+            exe_name = Path(item["image"]).name.casefold() if item["image"] else ""
+            title_match = bool(self.window_regex.search(title))
+            process_match = exe_name in {"happ.exe", "happ"}
+
+            if not (title_match or process_match):
+                continue
+
             try:
-                title = win.window_text()
-                if self.window_regex.search(title or "") and win.is_visible():
-                    candidates.append(win)
+                win = Desktop(backend="uia").window(handle=handle).wrapper_object()
+                candidates.append(win)
+                seen_handles.add(handle)
+                continue
+            except Exception:
+                pass
+
+            # Last-resort wrapper. This can still be useful for diagnostics,
+            # although child controls are richer through UIA.
+            try:
+                win = Desktop(backend="win32").window(handle=handle).wrapper_object()
+                candidates.append(win)
+                seen_handles.add(handle)
             except Exception:
                 continue
 
         if not candidates:
+            visible = self.visible_window_lines()
+            hint = ""
+            if visible:
+                sample = "\n".join(visible[:20])
+                hint = (
+                    "\nVisible top-level windows were:\n"
+                    + sample
+                    + "\nRun --list-windows for the complete list."
+                )
             raise RotationError(
                 "Happ window not found. Start Happ and open the Servers page."
+                + hint
             )
 
         # Prefer the largest visible matching window, not tray/tool windows.
@@ -440,6 +563,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="print text controls exposed by the current Happ window and exit",
     )
     parser.add_argument(
+        "--list-windows",
+        action="store_true",
+        help="print visible top-level Windows HWNDs/processes and exit",
+    )
+    parser.add_argument(
         "--inspect-output",
         help="also save --inspect output to this UTF-8 text file",
     )
@@ -455,6 +583,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     try:
+        if args.list_windows:
+            lines = HappUI.visible_window_lines()
+            print("\n".join(lines))
+            return 0
+
         if args.inspect:
             ui = HappUI(r"^Happ(?:\s|$).*")
             ui.connect()
