@@ -1,226 +1,288 @@
 # Happ Rotation Script
 
-Генератор JSON-конфигурации для **Happ / Xray**, который объединяет несколько прокси в один пул и распределяет **новые соединения** между ними.
+Скрипт для **ротации серверов внутри уже добавленной подписки Happ Desktop**.
 
-По умолчанию используется `roundRobin`:
+Он не создаёт новый Xray-конфиг и не импортирует отдельный профиль. Вместо этого скрипт управляет существующим окном Happ через Windows UI Automation и выбирает следующий сервер в уже добавленной подписке.
+
+Пример сценария:
 
 ```text
-новое соединение #1 -> proxy-001
-новое соединение #2 -> proxy-002
-новое соединение #3 -> proxy-003
-новое соединение #4 -> proxy-001
+LagomVPN
+├─ Германия
+├─ Финляндия
+├─ Швеция
+├─ Великобритания
+├─ Италия
+├─ Япония
+├─ США
+└─ Турция
 ```
 
-Это **не таймер смены IP**. Уже открытый HTTPS/WebSocket/QUIC-сеанс не переносится на другой прокси посреди соединения. Ротация происходит при создании новых outbound-соединений Xray.
+При `round-robin` скрипт переключает:
 
-## Что делает конфигурация
-
-- российские домены `geosite:category-ru` -> `DIRECT`;
-- российские IP `geoip:ru` -> `DIRECT`;
-- LAN, loopback и private IP -> `DIRECT` (важно для локальной сети и VDI);
-- остальной TCP/UDP-трафик -> пул прокси;
-- недоступные прокси отслеживаются через Xray `observatory`;
-- если все прокси недоступны, по умолчанию используется `BLOCK`, а не `DIRECT`, чтобы зарубежный трафик не ушёл наружу незаметно;
-- локальные входы: SOCKS5 `127.0.0.1:10808` и HTTP `127.0.0.1:10809`.
-
-## Поддерживаемые входные ссылки
-
-Скрипт понимает:
-
-- `vless://...`
-- `vmess://...` (обычный base64 JSON)
-- `trojan://...`
-- `socks://...` и `socks5://...`
-- `ss://...` (Shadowsocks SIP002)
-- raw Xray outbound JSON одной строкой — для нестандартных протоколов/транспортов.
-
-Для необычной конфигурации, которую парсер не понимает, добавьте в `proxies.txt` готовый Xray outbound одной строкой, например:
-
-```json
-{"protocol":"socks","settings":{"address":"127.0.0.1","port":2080}}
+```text
+Германия -> Финляндия -> Швеция -> ... -> Турция -> Германия
 ```
 
-## 1. Требования
+Маршрутизация, VDI, локальная сеть и сама подписка остаются такими, как уже настроены в Happ.
+
+## Совместимость
+
+Основной целевой вариант:
 
 - Windows 10/11;
-- Happ Desktop;
+- Happ Desktop 4.3.x;
+- существующая подписка с несколькими видимыми серверами;
 - Python 3.10+.
 
-Проверка Python:
+Скрипт использует `pywinauto` и Windows UI Automation. Он не редактирует внутреннюю БД Happ.
 
-```powershell
-py --version
-```
+## Почему именно так
 
-Внешние Python-библиотеки не нужны.
+В Happ есть механизм `subscription-autoconnect-type=random`, но он задаётся провайдером подписки и относится к выбору сервера при автоматическом подключении. Публичного API или deeplink для команды вида «выбрать сервер X в уже открытой подписке» в документации Happ нет.
 
-## 2. Скачать репозиторий
+Поэтому локальная автоматическая ротация существующего списка серверов выполняется через интерфейс Happ.
+
+Документация Happ:
+
+- App management: https://github.com/HappDev/happ_su/blob/main/dev-docs/app-management.md
+- Adding subscriptions: https://github.com/HappDev/happ_su/blob/main/faq/adding-configuration-subscription.md
+
+## Установка
+
+Клонируйте репозиторий:
 
 ```powershell
 git clone https://github.com/m-amirov/happ-rotation-script.git
 cd happ-rotation-script
 ```
 
-Либо скачайте ZIP с GitHub и распакуйте его.
-
-## 3. Создать список прокси
-
-Скопируйте пример:
+Создайте виртуальное окружение:
 
 ```powershell
-Copy-Item .\proxies.example.txt .\proxies.txt
-notepad .\proxies.txt
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-В `proxies.txt` оставьте по одному реальному прокси на строку:
+Установите зависимость:
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+Создайте рабочий конфиг:
+
+```powershell
+Copy-Item .\config.example.json .\config.json
+notepad .\config.json
+```
+
+`config.json` не коммитится в Git.
+
+## Настройка config.json
+
+Пример уже подготовлен под список серверов, показанный на скриншоте:
+
+```json
+{
+  "subscription": "LagomVPN",
+  "servers": [
+    "Германия",
+    "Финляндия",
+    "Швеция",
+    "Великобритания",
+    "Италия",
+    "Япония",
+    "США",
+    "Турция"
+  ],
+  "mode": "round-robin",
+  "interval_seconds": 600,
+  "settle_seconds": 4,
+  "reconnect_mode": "happ",
+  "require_subscription_visible": true
+}
+```
+
+`subscription` можно задавать без эмодзи: для `LagomVPN ✨` достаточно `LagomVPN`.
+
+Список `servers` определяет, какие строки разрешено использовать. Например, `YouTube (Глобальный)` намеренно не включён в пример — он не будет выбран. Если он тоже нужен в ротации, просто добавьте его в массив.
+
+### Режимы
+
+Последовательная ротация:
+
+```json
+"mode": "round-robin"
+```
+
+Случайная ротация без немедленного повторения текущего узла:
+
+```json
+"mode": "random"
+```
+
+Интервал задаётся в секундах:
+
+```json
+"interval_seconds": 600
+```
+
+Это 10 минут.
+
+## Сначала проверить UI Automation
+
+Откройте Happ и перейдите на страницу **Серверы**. Подписка должна быть видна.
+
+Запустите:
+
+```powershell
+py .\happ_rotation.py --inspect --inspect-output ui-tree.txt
+```
+
+Скрипт выведет названия элементов, которые Windows видит в интерфейсе Happ.
+
+В нормальном случае среди них будут строки вроде:
 
 ```text
-vless://UUID@server-1.example:443?encryption=none&security=reality&type=tcp&sni=example.com&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&flow=xtls-rprx-vision#server-1
-vless://UUID@server-2.example:443?encryption=none&security=reality&type=tcp&sni=example.com&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&flow=xtls-rprx-vision#server-2
-socks://login:password@proxy.example:1080#server-3
+'LagomVPN ✨'
+'Германия ⚡'
+'Финляндия'
+'Швеция'
+'США'
 ```
 
-`proxies.txt` добавлен в `.gitignore`, поэтому реальные логины, пароли, UUID и ключи не должны попасть в Git.
+Если названия серверов не появляются, UI конкретной сборки Happ не экспортирует эти элементы через UI Automation. В таком случае приложите `ui-tree.txt` к issue или передайте его для адаптации скрипта.
 
-## 4. Сгенерировать конфигурацию
+`ui-tree.txt` также исключён из Git.
+
+## Проверить одну смену сервера
+
+Перед реальным кликом можно проверить только выбор цели:
+
+```powershell
+py .\happ_rotation.py --once --dry-run
+```
+
+Реальное переключение один раз:
+
+```powershell
+py .\happ_rotation.py --once
+```
+
+При первом запуске `round-robin` будет выбран первый сервер из `config.json`. После этого выбранный узел сохраняется в локальном файле `.happ-rotation-state.json`, и следующий запуск возьмёт следующий сервер.
+
+## Выбрать конкретный сервер
+
+Например:
+
+```powershell
+py .\happ_rotation.py --server "США"
+```
+
+Это удобно для проверки того, что клик по строке Happ работает корректно.
+
+## Запустить постоянную ротацию
 
 ```powershell
 py .\happ_rotation.py
 ```
 
-Будет создан файл:
+Скрипт останется запущенным и будет переключать сервер раз в `interval_seconds`.
+
+Остановить:
 
 ```text
-happ-rotation.json
+Ctrl+C
 ```
 
-Явный вариант той же команды:
+## Что происходит при переключении
+
+Скрипт:
+
+1. подключается к уже открытому окну Happ;
+2. ищет указанную подписку;
+3. если серверы скрыты, пытается раскрыть подписку;
+4. ищет строку следующего сервера;
+5. предпочитает левый экземпляр названия, чтобы не нажать одноимённую подпись в правой части окна;
+6. вызывает UI Automation Invoke или, если он недоступен, делает обычный клик;
+7. сохраняет последний выбранный сервер.
+
+На Happ Desktop смена выбранной строки при активном подключении должна инициировать переключение самим приложением. Скрипт намеренно не делает дополнительный клик по большой кнопке питания, чтобы не создавать второй лишний цикл disconnect/connect.
+
+## Важное ограничение для VDI
+
+UI Automation работает в пользовательской Windows-сессии. Если VDI-сессия полностью отключена/заблокирована и приложение перестаёт иметь интерактивный desktop, обычный mouse fallback может не сработать.
+
+Скрипт сначала пытается использовать UIA Invoke, которому физический курсор не нужен. Но для гарантированной работы без активного desktop понадобился бы документированный API Happ или изменение его внутреннего хранилища; публичного стабильного API выбора сервера сейчас нет.
+
+## Автозапуск
+
+После того как `--once` работает стабильно, можно добавить запуск через Планировщик заданий Windows.
+
+Program:
+
+```text
+C:\path\to\happ-rotation-script\.venv\Scripts\python.exe
+```
+
+Arguments:
+
+```text
+C:\path\to\happ-rotation-script\happ_rotation.py
+```
+
+Start in:
+
+```text
+C:\path\to\happ-rotation-script
+```
+
+Для UI Automation задачу следует запускать в интерактивной пользовательской сессии, а не в изолированной service-session.
+
+## Диагностика
+
+Если появляется:
+
+```text
+Happ window not found
+```
+
+Запустите Happ и откройте его главное окно.
+
+Если появляется:
+
+```text
+Server '...' was not found
+```
+
+Проверьте фактическое название:
 
 ```powershell
-py .\happ_rotation.py --input .\proxies.txt --output .\happ-rotation.json --strategy roundRobin
+py .\happ_rotation.py --inspect
 ```
 
-## 5. Импортировать в Happ
+Если сервер в интерфейсе называется `Германия ⚡`, в `config.json` обычно достаточно `Германия`: используется точное совпадение, а затем безопасный substring match.
 
-Happ передаёт JSON-конфигурации в Xray напрямую, поэтому правила ротации и маршрутизации находятся внутри `happ-rotation.json`.
+## Тесты
 
-1. Откройте `happ-rotation.json` и скопируйте весь JSON.
-2. В Happ нажмите `+` и импортируйте конфигурацию из буфера обмена / JSON (название пункта может немного отличаться между версиями Desktop).
-3. Выберите созданный профиль **Happ Rotation**.
-4. Переподключите профиль.
-5. Для Desktop используйте Xray-совместимый режим. Если используете системный proxy, локальные порты уже заданы: SOCKS5 `10808`, HTTP `10809`.
-
-> Для JSON-профиля стандартные routing-настройки Happ не подмешиваются в конфигурацию: JSON передаётся core 1:1. Поэтому менять маршрутизацию нужно в этом генераторе/JSON, а после изменений переподключать профиль.
-
-## Стратегии ротации
-
-### Round robin — рекомендуется для обычной ротации
-
-```powershell
-py .\happ_rotation.py --strategy roundRobin
-```
-
-Новые соединения последовательно распределяются по прокси.
-
-### Random
-
-```powershell
-py .\happ_rotation.py --strategy random
-```
-
-Каждое новое соединение получает случайный доступный outbound.
-
-### Lowest ping
-
-```powershell
-py .\happ_rotation.py --strategy leastPing
-```
-
-Xray выбирает доступный outbound с минимальной задержкой по данным `observatory`. Это скорее балансировка по качеству, чем равномерная ротация.
-
-### Least load
-
-```powershell
-py .\happ_rotation.py --strategy leastLoad
-```
-
-Xray выбирает наиболее стабильные/подходящие узлы на основании наблюдений.
-
-## Если российские сайты тоже должны идти через прокси
-
-```powershell
-py .\happ_rotation.py --no-direct-ru
-```
-
-Private/LAN сети всё равно остаются `DIRECT`.
-
-## Что делать, если все прокси недоступны
-
-По умолчанию генератор работает fail-closed:
-
-```powershell
-py .\happ_rotation.py --fallback block
-```
-
-Если вы сознательно хотите разрешить обычный интернет при полном отказе пула:
-
-```powershell
-py .\happ_rotation.py --fallback direct
-```
-
-Второй режим может раскрыть реальный внешний IP для зарубежных ресурсов.
-
-## Изменение локальных портов
-
-```powershell
-py .\happ_rotation.py --socks-port 11808 --http-port 11809
-```
-
-## Частота проверки прокси
-
-По умолчанию Xray проверяет outbound-узлы каждые `30s`:
-
-```powershell
-py .\happ_rotation.py --probe-interval 30s
-```
-
-Например:
-
-```powershell
-py .\happ_rotation.py --probe-interval 1m
-```
-
-Не ставьте слишком маленький интервал без необходимости: постоянные тестовые запросы создают дополнительный трафик.
-
-## Проверка результата
-
-Синтаксическая проверка JSON:
-
-```powershell
-py -m json.tool .\happ-rotation.json > $null
-```
-
-Тесты проекта:
+Логика выбора следующего сервера тестируется без Windows/Happ:
 
 ```powershell
 py -m unittest discover -s tests -v
 ```
 
-## Важные ограничения
+GitHub Actions запускает эти тесты при каждом push и pull request.
 
-1. Ротация работает **на новых соединениях**, а не строго «раз в N минут».
-2. Сайты часто держат HTTP/2, QUIC или WebSocket открытыми долго, поэтому один сайт некоторое время может продолжать видеть тот же IP.
-3. `geosite:category-ru` и `geoip:ru` требуют соответствующих geo-файлов в Xray/Happ. Happ поставляется с geo-файлами и управляет ими на уровне приложения.
-4. Некоторые нестандартные URL-параметры провайдера невозможно безошибочно преобразовать автоматически. Для таких узлов используйте raw Xray outbound JSON.
-5. SOCKS5 сам по себе не шифрует соединение до SOCKS-сервера. Не используйте незашифрованный публичный SOCKS5 там, где это создаёт риск.
+## Безопасность
 
-## Почему используется JSON
+Скрипт:
 
-Happ поддерживает JSON-конфигурации и передаёт их в Xray без преобразования. Xray, в свою очередь, имеет штатные `routing.balancers` со стратегиями `roundRobin`, `random`, `leastPing` и `leastLoad`, а `observatory` используется для проверки состояния outbound-узлов.
+- не читает VPN-ключи;
+- не выгружает подписку;
+- не меняет URL подписки;
+- не редактирует внутреннюю базу Happ;
+- не создаёт новый VPN/Xray профиль;
+- управляет только выбором строки сервера в существующем интерфейсе Happ.
 
-Документация:
-
-- Happ JSON/config examples: https://github.com/HappDev/happ_su/blob/main/dev-docs/examples-of-links-and-parameters.md
-- Happ routing: https://github.com/HappDev/happ_su/blob/main/dev-docs/routing.md
-- Xray routing/balancers: https://xtls.github.io/en/config/routing
-- Xray observatory: https://xtls.github.io/en/config/observatory.html
+Файлы `config.json`, `.happ-rotation-state.json` и диагностический `ui-tree.txt` остаются локальными и исключены из Git.
