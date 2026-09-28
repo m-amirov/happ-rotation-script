@@ -10,15 +10,8 @@ from happ_rotation import (
     choose_next_server,
     load_config,
     load_state,
-    normalize_text,
     save_state,
 )
-
-
-class TextTests(unittest.TestCase):
-    def test_normalize_text(self):
-        self.assertEqual(normalize_text("  США  "), "сша")
-        self.assertEqual(normalize_text("LagomVPN ✨"), "lagomvpn ✨")
 
 
 class RotationTests(unittest.TestCase):
@@ -47,17 +40,27 @@ class RotationTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_config_valid(self):
+    def test_config_valid_and_default_rows(self):
+        cfg = RotationConfig.from_dict(
+            {
+                "subscription": "LagomVPN",
+                "servers": ["Германия", "Финляндия", "США"],
+                "interval_seconds": 60,
+            }
+        )
+        self.assertEqual(cfg.row_for_server("Германия"), 0)
+        self.assertEqual(cfg.row_for_server("США"), 2)
+
+    def test_explicit_server_rows(self):
         cfg = RotationConfig.from_dict(
             {
                 "subscription": "LagomVPN",
                 "servers": ["Германия", "США"],
-                "mode": "round-robin",
+                "server_rows": {"Германия": 0, "США": 6},
                 "interval_seconds": 60,
             }
         )
-        self.assertEqual(cfg.subscription, "LagomVPN")
-        self.assertEqual(cfg.servers, ("Германия", "США"))
+        self.assertEqual(cfg.row_for_server("США"), 6)
 
     def test_requires_two_servers(self):
         with self.assertRaises(RotationError):
@@ -69,13 +72,14 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
-    def test_interval_minimum(self):
+    def test_invalid_coordinate_ratio(self):
         with self.assertRaises(RotationError):
             RotationConfig.from_dict(
                 {
                     "subscription": "LagomVPN",
                     "servers": ["Германия", "США"],
-                    "interval_seconds": 5,
+                    "interval_seconds": 60,
+                    "click_x_ratio": 1.5,
                 }
             )
 
